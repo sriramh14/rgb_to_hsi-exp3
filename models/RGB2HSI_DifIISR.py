@@ -13,7 +13,6 @@ from loss.mrae_loss import mrae_loss
 from loss.sam_loss import sam_loss
 from loss.spectral_gradient_loss import spectral_gradient_loss
 from loss.spectral_smoothness_loss import spectral_smoothness_loss
-from loss.rgb_consistency_loss import rgb_consistency_loss
 
 
 class RGB2HSI_DifIISR(nn.Module):
