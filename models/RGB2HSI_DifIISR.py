@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .CoarseHSINet import CoarseHSINet
 from .HSIResidualDiffusionUNet import HSIResidualDiffusionUNet
 from typing import Optional
