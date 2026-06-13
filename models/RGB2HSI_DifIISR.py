@@ -155,10 +155,10 @@ class RGB2HSI_DifIISR(nn.Module):
         loss_weights: Optional[dict[str, float]] = None,
     ) -> dict[str, torch.Tensor]:
         weights = {
-            "diffusion": 0.8,
+            "diffusion": 1,
             "coarse_l1": 0.2,
-            "recon_l1": 0.4,
-            "mrae": 0.5,
+            "recon_l1": 0.3,
+            "mrae": 0.6,
             "sam": 0.05,
             "spectral_grad": 0.05,
             "rgb": 0.0,
