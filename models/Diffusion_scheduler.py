@@ -22,7 +22,7 @@ def make_eta_schedule(
     return sqrt_etas.float()
 
 
-def extract_to_shape(values: torch.Tensor, t: torch.Tensor, x_shape: Tuple[int, ...]) -> torch.Tensor:
+def extract_to_shape(values: torch.Tensor, t: torch.Tensor, x_shape: tuple[int, ...]) -> torch.Tensor:
     """
     Gather 1D schedule values at timestep t and broadcast to x_shape.
     values: [T]
