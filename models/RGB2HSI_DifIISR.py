@@ -5,7 +5,7 @@ from .CoarseHSINet import CoarseHSINet
 from .HSIResidualDiffusionUNet import HSIResidualDiffusionUNet
 from typing import Optional
 from .Diffusion_scheduler import extract_to_shape, make_eta_schedule
-from loss import *
+from loss import mrae_loss,sam_loss,spectral_gradient_loss,spectral_smoothness_loss,rgb_consistency_loss
 class RGB2HSI_DifIISR(nn.Module):
     """
     RGB-to-HSI model adapted from DifIISR's residual-shift diffusion idea.
