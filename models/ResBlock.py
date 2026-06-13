@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .GroupNorm32 import GroupNorm32
 class ResBlock(nn.Module):
     """Residual block with timestep conditioning."""
