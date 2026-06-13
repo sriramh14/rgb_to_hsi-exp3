@@ -1,3 +1,5 @@
+import torch
+import torch.nn as nn
 def project_hsi_to_rgb(hsi: torch.Tensor, response_matrix: torch.Tensor) -> torch.Tensor:
     """
     Project HSI to RGB using a spectral response matrix.
