@@ -1,3 +1,5 @@
+import torch
+import torch.nn as nn
 class WindowAttentionBlock(nn.Module):
     """
     Lightweight Swin-like local self-attention block.
