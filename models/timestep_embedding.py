@@ -1,3 +1,5 @@
+import torch
+import torch.nn as nn
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
     """
     Sinusoidal timestep embedding.
