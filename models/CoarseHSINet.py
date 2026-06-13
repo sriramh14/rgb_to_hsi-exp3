@@ -1,6 +1,6 @@
 import torch 
 import torch.nn as nn
-
+from .GroupNorm32 import GroupNorm32
 class ConvBlock(nn.Module):
     """Simple conv block for the coarse RGB-to-HSI branch."""
     def __init__(self, in_ch: int, out_ch: int):
