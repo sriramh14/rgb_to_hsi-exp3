@@ -1,691 +1,686 @@
-"""
-Train RGB2HSI_DifIISR on ARAD/NTIRE2020 RGB-HSI pairs.
+#!/usr/bin/env python3
+"""Config-based training/evaluation entry point for RGB-to-HSI DifIISR.
 
-Expected default dataset layout after download:
-    data/
-      NTIRE2020_Train_Spectral/*.mat
-      NTIRE2020_Train_RealWorld/*.jpg
+Edit the CONFIG section and run:
 
-The ARADDataset class below is adapted from the loader provided by the user.
-It returns:
-    rgb: [3, image_size, image_size], float32
-    hsi: [bands, image_size, image_size], float32
+    python main.py
 
-Example:
-    python main.py --root_dir data --download --epochs 100 --batch_size 1 --base_channels 32
+This script intentionally has no command-line parser. It expects your
+existing dataset loader at:
 
-Resume:
-    python main.py --resume exp_rgb2hsi/latest.pth
+    dataset/dataset_loader.py
+
+with:
+
+    from dataset.dataset_loader import ARADDataset
+
+The dataset may return either:
+    (rgb, hsi)
+
+or a dictionary containing:
+    {"rgb": rgb, "hsi": hsi}
+
+where rgb is [B, 3, H, W] and hsi is [B, NUM_BANDS, H, W].
 """
 
 from __future__ import annotations
 
-import argparse
-import json
 import math
-import os
 import random
-import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
-import scipy.io as sio
-from PIL import Image
-
 import torch
 import torch.nn.functional as F
-from torch import nn
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
+from dataset.dataset_loader import ARADDataset
+from loss import mrae_loss, sam_loss, spectral_gradient_loss
 from models import RGB2HSI_DifIISR
 
 
-class ARADDataset(Dataset):
-    """
-    ARAD / NTIRE2020 paired RGB-HSI dataset loader.
+# ==================================================
+# CONFIG
+# ==================================================
 
-    This follows the loader provided in the chat, with a few small additions:
-      - configurable image_size;
-      - optional HSI normalization mode;
-      - safer HSI channel layout handling;
-      - optional bands check.
-    """
+MODE = "train"                 # "train" or "eval"
 
-    def __init__(
-        self,
-        root_dir: str = "data",
-        train: bool = True,
-        train_images: int = 200,
-        total_images: int = 230,
-        cube_key: str = "cube",
-        download: bool = True,
-        image_size: int = 256,
-        bands: Optional[int] = 31,
-        hsi_norm: str = "none",
-        hsi_scale: float = 1.0,
-    ):
-        super().__init__()
-        if hsi_norm not in {"none", "sample_max", "constant"}:
-            raise ValueError("hsi_norm must be one of: none, sample_max, constant")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 42
 
-        self.cube_key = cube_key
-        self.image_size = int(image_size)
-        self.bands = bands
-        self.hsi_norm = hsi_norm
-        self.hsi_scale = float(hsi_scale)
+# Dataset configuration.
+DATA_ROOT = "data"
+HSI_KEY = "cube"
+DOWNLOAD_DATA = True
+TRAIN_IMAGES = 200
+TOTAL_IMAGES = 230
 
-        spectral_dir = os.path.join(root_dir, "NTIRE2020_Train_Spectral")
-        rgb_dir = os.path.join(root_dir, "NTIRE2020_Train_RealWorld")
+# Dataloader.
+BATCH_SIZE = 1
+VAL_BATCH_SIZE = 1
+NUM_WORKERS = 4
+PIN_MEMORY = DEVICE == "cuda"
 
-        os.makedirs(spectral_dir, exist_ok=True)
-        os.makedirs(rgb_dir, exist_ok=True)
+# Training.
+NUM_EPOCHS = 100
+LR = 1e-4
+WEIGHT_DECAY = 0.0
+GRAD_CLIP_NORM = 1.0
+USE_AMP = True
 
-        if download:
-            self._download_if_needed(
-                root_dir=root_dir,
-                spectral_dir=spectral_dir,
-                rgb_dir=rgb_dir,
-                total_images=total_images,
-            )
+# Scheduler / early stopping.
+EARLY_STOPPING_PATIENCE = 20
+LR_PATIENCE = 5
+LR_FACTOR = 0.5
+MIN_LR = 1e-7
 
-        hsi_files = sorted([f for f in os.listdir(spectral_dir) if f.endswith(".mat")])[:total_images]
+# Model.
+NUM_BANDS = 31
+BASE_CHANNELS = 32
+DIFFUSION_STEPS = 15
+KAPPA = 2.0
+MIN_NOISE_LEVEL = 0.04
+ETAS_END = 0.99
+SCHEDULE_POWER = 0.3
+PREDICT_TYPE = "xstart"        # "xstart", "epsilon", or "residual"
+CONDITION_RGB = True
+NUM_HEADS = 4
+WINDOW_SIZE = 8
+DROPOUT = 0.0
 
-        rgb_lookup = {
-            f.replace("_RealWorld.jpg", ""): f
-            for f in os.listdir(rgb_dir)
-            if f.endswith(".jpg")
-        }
+# Loss weights. These keys match RGB2HSI_DifIISR.compute_losses().
+LOSS_WEIGHTS = {
+    "diffusion": 1.0,
+    "coarse_l1": 0.2,
+    "recon_l1": 0.5,
+    "mrae": 0.2,
+    "sam": 0.05,
+    "spectral_grad": 0.05,
+    "rgb": 0.0,                 # set >0 only if RESPONSE_MATRIX_PATH is provided
+}
 
-        pairs = []
-        for hsi_name in hsi_files:
-            stem = os.path.splitext(hsi_name)[0]
-            if stem not in rgb_lookup:
-                continue
-            pairs.append((os.path.join(spectral_dir, hsi_name), os.path.join(rgb_dir, rgb_lookup[stem])))
+# Optional spectral response matrix for RGB consistency.
+# Expected shape: [3, NUM_BANDS]. Supported: .npy or torch checkpoint tensor.
+RESPONSE_MATRIX_PATH: Optional[Union[str, Path]] = None
 
-        print(f"Found {len(pairs)} paired samples")
+# If your HSI cubes are not normalized to [0, 1], set this to False.
+CLIP_DENOISED = True
 
-        if train:
-            self.pairs = pairs[:train_images]
-        else:
-            self.pairs = pairs[train_images:]
+# Checkpoints.
+CHECKPOINT_DIR = Path("checkpoints")
+LATEST_PATH = CHECKPOINT_DIR / "rgb2hsi_difiisr_latest.pth"
+BEST_PATH = CHECKPOINT_DIR / "rgb2hsi_difiisr_best.pth"
+BEST_LOSS_PATH = CHECKPOINT_DIR / "rgb2hsi_difiisr_best_loss.pth"
+RESUME_CHECKPOINT: Optional[Union[str, Path]] = None
+EVAL_CHECKPOINT: Optional[Union[str, Path]] = None
 
-        split_name = "Train" if train else "Val"
-        print(f"{split_name}: {len(self.pairs)} samples")
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-        if len(self.pairs) == 0:
-            raise RuntimeError(
-                f"No samples found for {split_name}. Check root_dir, train_images, total_images, and filenames."
-            )
 
-    @staticmethod
-    def _download_if_needed(root_dir: str, spectral_dir: str, rgb_dir: str, total_images: int) -> None:
-        existing_hsi = [f for f in os.listdir(spectral_dir) if f.endswith(".mat")]
-        existing_rgb = [f for f in os.listdir(rgb_dir) if f.endswith(".jpg")]
-
-        if len(existing_hsi) >= total_images and len(existing_rgb) >= total_images:
-            return
-
-        from huggingface_hub import hf_hub_download, list_repo_files
-
-        print(f"Downloading {total_images} HSI files and {total_images} RGB files...")
-
-        repo_files = list_repo_files("mhmdjouni/arad_hsdb", repo_type="dataset")
-
-        hsi_files = sorted(
-            [f for f in repo_files if f.endswith(".mat") and "NTIRE2020_Train_Spectral" in f]
-        )[:total_images]
-
-        rgb_files = sorted(
-            [f for f in repo_files if f.endswith(".jpg") and "NTIRE2020_Train_RealWorld" in f]
-        )[:total_images]
-
-        for file in hsi_files:
-            hf_hub_download(
-                repo_id="mhmdjouni/arad_hsdb",
-                repo_type="dataset",
-                filename=file,
-                local_dir=root_dir,
-                local_dir_use_symlinks=False,
-            )
-
-        for file in rgb_files:
-            hf_hub_download(
-                repo_id="mhmdjouni/arad_hsdb",
-                repo_type="dataset",
-                filename=file,
-                local_dir=root_dir,
-                local_dir_use_symlinks=False,
-            )
-
-        print("Download complete")
-
-    def __len__(self) -> int:
-        return len(self.pairs)
-
-    def _load_hsi(self, hsi_path: str) -> torch.Tensor:
-        mat = sio.loadmat(hsi_path)
-        if self.cube_key not in mat:
-            keys = [k for k in mat.keys() if not k.startswith("__")]
-            raise KeyError(f"cube_key='{self.cube_key}' not found in {hsi_path}. Available keys: {keys}")
-
-        hsi = mat[self.cube_key].astype(np.float32)
-        if hsi.ndim != 3:
-            raise ValueError(f"Expected 3D HSI cube, got shape {hsi.shape} in {hsi_path}")
-
-        # ARAD/NTIRE cubes are usually [H, W, C]. If already [C, H, W], keep it.
-        if self.bands is not None:
-            if hsi.shape[-1] == self.bands:
-                hsi = np.transpose(hsi, (2, 0, 1))
-            elif hsi.shape[0] == self.bands:
-                pass
-            else:
-                raise ValueError(
-                    f"Could not identify spectral dimension for {hsi_path}. "
-                    f"Expected {self.bands} bands, got shape {hsi.shape}."
-                )
-        else:
-            # Fallback to the user's original assumption: [H,W,C] -> [C,H,W].
-            hsi = np.transpose(hsi, (2, 0, 1))
-
-        if self.hsi_norm == "sample_max":
-            max_val = float(np.max(hsi))
-            if max_val > 0:
-                hsi = hsi / max_val
-        elif self.hsi_norm == "constant":
-            hsi = hsi / max(self.hsi_scale, 1e-12)
-        # hsi_norm == "none" follows the user-provided loader exactly.
-
-        hsi_t = torch.from_numpy(hsi).float()
-        hsi_t = F.interpolate(
-            hsi_t.unsqueeze(0),
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
-        return hsi_t
-
-    def _load_rgb(self, rgb_path: str) -> torch.Tensor:
-        rgb = Image.open(rgb_path).convert("RGB")
-        rgb = np.array(rgb, dtype=np.float32) / 255.0
-        rgb = np.transpose(rgb, (2, 0, 1))
-        rgb_t = torch.from_numpy(rgb).float()
-        rgb_t = F.interpolate(
-            rgb_t.unsqueeze(0),
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
-        return rgb_t
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        hsi_path, rgb_path = self.pairs[idx]
-        hsi = self._load_hsi(hsi_path)
-        rgb = self._load_rgb(rgb_path)
-        return rgb, hsi
+# ==================================================
+# REPRODUCIBILITY
+# ==================================================
 
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def seed_worker(worker_id: int) -> None:
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
+    worker_seed = (torch.initial_seed() + worker_id) % (2**32)
     random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
-def make_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int, seed: int) -> DataLoader:
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=shuffle,
-        worker_init_fn=seed_worker,
-        generator=generator,
-        persistent_workers=(num_workers > 0),
-    )
+# ==================================================
+# SMALL UTILITIES
+# ==================================================
 
 
-def load_response_matrix(path: Optional[str], bands: int, device: torch.device) -> Optional[torch.Tensor]:
-    if path is None or path == "":
+def unpack_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Normalize supported dataset outputs to rgb, hsi."""
+    if isinstance(batch, dict):
+        rgb = batch.get("rgb", batch.get("lq"))
+        hsi = batch.get("hsi", batch.get("gt"))
+        if rgb is None or hsi is None:
+            raise KeyError(
+                "Dictionary batch must contain ('rgb','hsi') or ('lq','gt'). "
+                f"Available keys: {list(batch.keys())}"
+            )
+    elif isinstance(batch, (list, tuple)):
+        if len(batch) < 2:
+            raise ValueError("Tuple/list batch must contain at least [rgb, hsi].")
+        rgb, hsi = batch[0], batch[1]
+    else:
+        raise TypeError(f"Unsupported batch type: {type(batch).__name__}")
+
+    if not torch.is_tensor(rgb) or not torch.is_tensor(hsi):
+        raise TypeError(
+            "After DataLoader collation, RGB and HSI must be tensors. "
+            f"Received rgb={type(rgb).__name__}, hsi={type(hsi).__name__}."
+        )
+
+    if rgb.ndim != 4 or hsi.ndim != 4:
+        raise ValueError(
+            "Expected batched tensors rgb=[B,3,H,W] and hsi=[B,L,H,W], "
+            f"got rgb={tuple(rgb.shape)}, hsi={tuple(hsi.shape)}."
+        )
+
+    if rgb.shape[1] != 3:
+        raise ValueError(f"Expected RGB to have 3 channels, got {rgb.shape[1]}.")
+
+    if hsi.shape[1] != NUM_BANDS:
+        raise ValueError(f"Expected HSI to have {NUM_BANDS} bands, got {hsi.shape[1]}.")
+
+    return rgb, hsi
+
+
+def make_grad_scaler(enabled: bool):
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def autocast_context(enabled: bool):
+    try:
+        return torch.amp.autocast("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.autocast(enabled=enabled)
+
+
+def load_response_matrix(device: torch.device) -> Optional[torch.Tensor]:
+    if RESPONSE_MATRIX_PATH is None:
         return None
 
-    path_obj = Path(path)
-    if not path_obj.exists():
-        raise FileNotFoundError(f"response_matrix not found: {path}")
+    path = Path(RESPONSE_MATRIX_PATH)
+    if not path.exists():
+        raise FileNotFoundError(f"RESPONSE_MATRIX_PATH not found: {path}")
 
-    if path_obj.suffix.lower() == ".npy":
-        matrix = np.load(path_obj)
-    elif path_obj.suffix.lower() == ".npz":
-        loaded = np.load(path_obj)
-        key = "response" if "response" in loaded else list(loaded.keys())[0]
-        matrix = loaded[key]
-    elif path_obj.suffix.lower() == ".mat":
-        loaded = sio.loadmat(path_obj)
-        keys = [k for k in loaded.keys() if not k.startswith("__")]
-        key = "response" if "response" in loaded else keys[0]
-        matrix = loaded[key]
-    elif path_obj.suffix.lower() in {".csv", ".txt"}:
-        matrix = np.loadtxt(path_obj, delimiter="," if path_obj.suffix.lower() == ".csv" else None)
+    if path.suffix.lower() == ".npy":
+        matrix = torch.from_numpy(np.load(path)).float()
     else:
-        raise ValueError("response_matrix must be .npy, .npz, .mat, .csv, or .txt")
+        loaded = torch.load(path, map_location="cpu")
+        matrix = loaded.float() if torch.is_tensor(loaded) else torch.as_tensor(loaded).float()
 
-    matrix = np.asarray(matrix, dtype=np.float32)
-    if matrix.shape == (bands, 3):
-        matrix = matrix.T
-    if matrix.shape != (3, bands):
-        raise ValueError(f"Expected response matrix shape [3,{bands}] or [{bands},3], got {matrix.shape}")
+    if matrix.shape != (3, NUM_BANDS):
+        raise ValueError(
+            f"Response matrix must have shape [3, {NUM_BANDS}], got {tuple(matrix.shape)}."
+        )
 
-    matrix_t = torch.from_numpy(matrix).float().to(device)
-    return matrix_t
+    return matrix.to(device)
 
 
-def loss_weight_dict(args: argparse.Namespace) -> Dict[str, float]:
+def model_config_dict() -> Dict[str, Any]:
     return {
-        "diffusion": args.w_diffusion,
-        "coarse_l1": args.w_coarse_l1,
-        "recon_l1": args.w_recon_l1,
-        "mrae": args.w_mrae,
-        "sam": args.w_sam,
-        "spectral_grad": args.w_spectral_grad,
-        "rgb": args.w_rgb,
+        "bands": NUM_BANDS,
+        "base_channels": BASE_CHANNELS,
+        "steps": DIFFUSION_STEPS,
+        "kappa": KAPPA,
+        "min_noise_level": MIN_NOISE_LEVEL,
+        "etas_end": ETAS_END,
+        "schedule_power": SCHEDULE_POWER,
+        "predict_type": PREDICT_TYPE,
+        "condition_rgb": CONDITION_RGB,
+        "num_heads": NUM_HEADS,
+        "window_size": WINDOW_SIZE,
+        "dropout": DROPOUT,
     }
 
 
-def sam_metric(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    pred_f = pred.flatten(2)
-    target_f = target.flatten(2)
-    dot = (pred_f * target_f).sum(dim=1)
-    denom = torch.linalg.norm(pred_f, dim=1) * torch.linalg.norm(target_f, dim=1) + eps
-    angle = torch.acos(torch.clamp(dot / denom, -1.0 + 1e-6, 1.0 - 1e-6))
-    return angle.mean()
+def build_model(device: torch.device) -> RGB2HSI_DifIISR:
+    model = RGB2HSI_DifIISR(**model_config_dict())
+    return model.to(device)
 
 
-def compute_metrics(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> Dict[str, float]:
-    pred = pred.float()
-    target = target.float()
-    mse = F.mse_loss(pred, target)
-    rmse = torch.sqrt(mse)
-    mrae = ((pred - target).abs() / (target.abs() + 1e-3)).mean()
-    psnr = 20.0 * torch.log10(torch.tensor(float(data_range), device=pred.device) / rmse.clamp_min(1e-12))
-    sam = sam_metric(pred, target)
+# ==================================================
+# DATA
+# ==================================================
+
+
+def make_dataloaders(device: torch.device) -> Tuple[Optional[DataLoader], DataLoader]:
+    set_seed(SEED)
+    generator = torch.Generator()
+    generator.manual_seed(SEED)
+
+    train_loader: Optional[DataLoader] = None
+
+    if MODE == "train":
+        train_dataset = ARADDataset(
+            root_dir=DATA_ROOT,
+            train=True,
+            train_images=TRAIN_IMAGES,
+            total_images=TOTAL_IMAGES,
+            cube_key=HSI_KEY,
+            download=DOWNLOAD_DATA,
+        )
+
+        if len(train_dataset) == 0:
+            raise RuntimeError("Training dataset is empty. Check DATA_ROOT and ARAD file pairing.")
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=NUM_WORKERS,
+            pin_memory=(device.type == "cuda" and PIN_MEMORY),
+            worker_init_fn=seed_worker if NUM_WORKERS > 0 else None,
+            generator=generator,
+            drop_last=False,
+        )
+
+    val_dataset = ARADDataset(
+        root_dir=DATA_ROOT,
+        train=False,
+        train_images=TRAIN_IMAGES,
+        total_images=TOTAL_IMAGES,
+        cube_key=HSI_KEY,
+        download=DOWNLOAD_DATA if MODE == "eval" else False,
+    )
+
+    if len(val_dataset) == 0:
+        raise RuntimeError("Validation dataset is empty. Check TRAIN_IMAGES/TOTAL_IMAGES and file pairing.")
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=VAL_BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=(device.type == "cuda" and PIN_MEMORY),
+        worker_init_fn=seed_worker if NUM_WORKERS > 0 else None,
+        drop_last=False,
+    )
+
+    return train_loader, val_loader
+
+
+# ==================================================
+# METRICS
+# ==================================================
+
+
+def rmse_metric(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return torch.sqrt(F.mse_loss(pred, target).clamp_min(1e-12))
+
+
+def psnr_metric(pred: torch.Tensor, target: torch.Tensor, max_value: float = 1.0) -> torch.Tensor:
+    mse = F.mse_loss(pred, target).clamp_min(1e-12)
+    max_tensor = torch.tensor(max_value, device=pred.device, dtype=pred.dtype)
+    return 20.0 * torch.log10(max_tensor) - 10.0 * torch.log10(mse)
+
+
+def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
     return {
-        "mrae": float(mrae.detach().cpu()),
-        "rmse": float(rmse.detach().cpu()),
-        "psnr": float(psnr.detach().cpu()),
-        "sam": float(sam.detach().cpu()),
+        "mrae": float(mrae_loss(pred, target).item()),
+        "rmse": float(rmse_metric(pred, target).item()),
+        "sam": float(sam_loss(pred, target).item()),
+        "psnr": float(psnr_metric(pred, target).item()),
     }
 
 
-class AverageMeter:
-    def __init__(self) -> None:
-        self.sum = 0.0
-        self.count = 0
-
-    def update(self, value: float, n: int = 1) -> None:
-        self.sum += float(value) * int(n)
-        self.count += int(n)
-
-    @property
-    def avg(self) -> float:
-        return self.sum / max(self.count, 1)
+# ==================================================
+# CHECKPOINTS
+# ==================================================
 
 
 def save_checkpoint(
     path: Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    *,
     epoch: int,
-    best_mrae: float,
-    args: argparse.Namespace,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau],
+    best_val_mrae: float,
+    best_val_loss: float,
+    epochs_without_improvement: int,
 ) -> None:
+    payload = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "model_config": model_config_dict(),
+        "loss_weights": LOSS_WEIGHTS,
+        "best_val_mrae": best_val_mrae,
+        "best_val_loss": best_val_loss,
+        "epochs_without_improvement": epochs_without_improvement,
+    }
+
+    if optimizer is not None:
+        payload["optimizer"] = optimizer.state_dict()
+
+    if scheduler is not None:
+        payload["scheduler"] = scheduler.state_dict()
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict(),
-            "best_mrae": best_mrae,
-            "args": vars(args),
-        },
-        path,
-    )
+    torch.save(payload, path)
 
 
-def load_checkpoint(
-    path: str,
-    model: nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    scaler: Optional[GradScaler] = None,
-    device: Optional[torch.device] = None,
-) -> Tuple[int, float]:
-    ckpt = torch.load(path, map_location=device or "cpu")
-    model.load_state_dict(ckpt["model"], strict=True)
-    if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and "scaler" in ckpt:
-        scaler.load_state_dict(ckpt["scaler"])
-    start_epoch = int(ckpt.get("epoch", 0)) + 1
-    best_mrae = float(ckpt.get("best_mrae", math.inf))
-    return start_epoch, best_mrae
+def load_checkpoint(path: Union[str, Path], device: torch.device) -> Dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
+
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        raise ValueError(
+            f"{path} is not a valid RGB-to-HSI DifIISR checkpoint. "
+            "Expected a dictionary containing a 'model' state dict."
+        )
+
+    return checkpoint
 
 
-def train_one_epoch(
-    model: RGB2HSI_DifIISR,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
-    device: torch.device,
-    args: argparse.Namespace,
-    response_matrix: Optional[torch.Tensor],
-    epoch: int,
-) -> Dict[str, float]:
-    model.train()
-    weights = loss_weight_dict(args)
-    meters = {name: AverageMeter() for name in [
-        "loss", "loss_diffusion", "loss_coarse_l1", "loss_recon_l1",
-        "loss_mrae", "loss_sam", "loss_spectral_grad", "loss_rgb"
-    ]}
-
-    start = time.time()
-    optimizer.zero_grad(set_to_none=True)
-
-    for step, (rgb, hsi) in enumerate(loader, start=1):
-        rgb = rgb.to(device, non_blocking=True)
-        hsi = hsi.to(device, non_blocking=True)
-
-        with autocast(enabled=args.amp and device.type == "cuda"):
-            out = model(
-                rgb=rgb,
-                hsi_gt=hsi,
-                return_loss=True,
-                response_matrix=response_matrix,
-                loss_weights=weights,
-            )
-            loss = out["loss"] / args.grad_accum_steps
-
-        scaler.scale(loss).backward()
-
-        if step % args.grad_accum_steps == 0:
-            if args.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-
-        batch_size = rgb.shape[0]
-        for name in meters.keys():
-            if name in out:
-                meters[name].update(float(out[name].detach().cpu()), batch_size)
-
-        if step % args.log_every == 0:
-            elapsed = time.time() - start
-            print(
-                f"Epoch {epoch:03d} | Step {step:04d}/{len(loader)} | "
-                f"Loss {meters['loss'].avg:.5f} | "
-                f"MRAE-loss {meters['loss_mrae'].avg:.5f} | "
-                f"SAM-loss {meters['loss_sam'].avg:.5f} | "
-                f"Time {elapsed:.1f}s"
-            )
-
-    return {name: meter.avg for name, meter in meters.items()}
+# ==================================================
+# VALIDATION
+# ==================================================
 
 
 @torch.no_grad()
 def validate(
     model: RGB2HSI_DifIISR,
-    loader: DataLoader,
+    val_loader: DataLoader,
     device: torch.device,
-    args: argparse.Namespace,
     response_matrix: Optional[torch.Tensor],
 ) -> Dict[str, float]:
     model.eval()
-    weights = loss_weight_dict(args)
-    loss_meter = AverageMeter()
-    metric_meters = {name: AverageMeter() for name in ["mrae", "rmse", "psnr", "sam"]}
 
-    for rgb, hsi in loader:
-        rgb = rgb.to(device, non_blocking=True)
-        hsi = hsi.to(device, non_blocking=True)
+    totals = {
+        "loss": 0.0,
+        "mrae": 0.0,
+        "rmse": 0.0,
+        "sam": 0.0,
+        "psnr": 0.0,
+    }
+    count = 0
 
-        if args.val_mode == "sample":
-            sample_out = model.sample(rgb, clip_denoised=args.clip_val_pred)
-            pred = sample_out["hsi"]
-            # Also compute training loss on a deterministic low-noise step for logging.
-            t = torch.zeros((rgb.shape[0],), device=device, dtype=torch.long)
-            noise = torch.zeros_like(hsi)
-            out = model(
+    for batch in val_loader:
+        rgb, hsi = unpack_batch(batch)
+        rgb = rgb.to(device, non_blocking=(device.type == "cuda"))
+        hsi = hsi.to(device, non_blocking=(device.type == "cuda"))
+
+        sample_out = model.sample(
+            rgb=rgb,
+            clip_denoised=CLIP_DENOISED,
+            return_all=False,
+        )
+        pred_hsi = sample_out["hsi"]
+
+        val_loss = (
+            LOSS_WEIGHTS["recon_l1"] * F.l1_loss(pred_hsi, hsi)
+            + LOSS_WEIGHTS["mrae"] * mrae_loss(pred_hsi, hsi)
+            + LOSS_WEIGHTS["sam"] * sam_loss(pred_hsi, hsi)
+            + LOSS_WEIGHTS["spectral_grad"] * spectral_gradient_loss(pred_hsi, hsi)
+        )
+
+        # Optional RGB consistency for validation if a response matrix is available.
+        if response_matrix is not None and LOSS_WEIGHTS.get("rgb", 0.0) > 0:
+            val_forward = model(
                 rgb=rgb,
                 hsi_gt=hsi,
-                t=t,
-                noise=noise,
                 return_loss=True,
                 response_matrix=response_matrix,
-                loss_weights=weights,
+                loss_weights=LOSS_WEIGHTS,
             )
-        else:
-            # Fast validation: denoise the lowest-noise state with zero injected noise.
-            t = torch.zeros((rgb.shape[0],), device=device, dtype=torch.long)
-            noise = torch.zeros_like(hsi)
-            out = model(
-                rgb=rgb,
-                hsi_gt=hsi,
-                t=t,
-                noise=noise,
-                return_loss=True,
-                response_matrix=response_matrix,
-                loss_weights=weights,
-            )
-            pred = out["pred_hsi"]
-            if args.clip_val_pred:
-                pred = pred.clamp(0, 1)
+            val_loss = val_forward["loss"]
 
+        batch_metrics = compute_metrics(pred_hsi, hsi)
         batch_size = rgb.shape[0]
-        loss_meter.update(float(out["loss"].detach().cpu()), batch_size)
-        metrics = compute_metrics(pred, hsi, data_range=args.metric_data_range)
-        for name, value in metrics.items():
-            metric_meters[name].update(value, batch_size)
+        totals["loss"] += float(val_loss.item()) * batch_size
+        for name in ("mrae", "rmse", "sam", "psnr"):
+            totals[name] += batch_metrics[name] * batch_size
+        count += batch_size
 
-    results = {f"val_{name}": meter.avg for name, meter in metric_meters.items()}
-    results["val_loss"] = loss_meter.avg
-    return results
+    if count == 0:
+        raise RuntimeError("Validation loader is empty.")
+
+    return {name: value / count for name, value in totals.items()}
 
 
-def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train DifIISR-style RGB-to-HSI residual diffusion model")
+# ==================================================
+# TRAINING
+# ==================================================
 
-    # Dataset
-    parser.add_argument("--root_dir", type=str, default="data")
-    parser.add_argument("--download", action="store_true", help="Download ARAD/NTIRE2020 files from Hugging Face if missing")
-    parser.add_argument("--no_download", action="store_true", help="Disable download even if files are missing")
-    parser.add_argument("--train_images", type=int, default=200)
-    parser.add_argument("--total_images", type=int, default=230)
-    parser.add_argument("--cube_key", type=str, default="cube")
-    parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--bands", type=int, default=31)
-    parser.add_argument("--hsi_norm", type=str, default="none", choices=["none", "sample_max", "constant"])
-    parser.add_argument("--hsi_scale", type=float, default=1.0)
 
-    # Model
-    parser.add_argument("--base_channels", type=int, default=32)
-    parser.add_argument("--steps", type=int, default=15)
-    parser.add_argument("--kappa", type=float, default=2.0)
-    parser.add_argument("--min_noise_level", type=float, default=0.04)
-    parser.add_argument("--etas_end", type=float, default=0.99)
-    parser.add_argument("--schedule_power", type=float, default=0.3)
-    parser.add_argument("--predict_type", type=str, default="xstart", choices=["xstart", "epsilon", "residual"])
-    parser.add_argument("--condition_rgb", action="store_true", default=True)
-    parser.add_argument("--no_condition_rgb", action="store_false", dest="condition_rgb")
-    parser.add_argument("--num_heads", type=int, default=4)
-    parser.add_argument("--window_size", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.0)
+def train() -> None:
+    set_seed(SEED)
 
-    # Loss weights
-    parser.add_argument("--w_diffusion", type=float, default=1.0)
-    parser.add_argument("--w_coarse_l1", type=float, default=0.2)
-    parser.add_argument("--w_recon_l1", type=float, default=0.5)
-    parser.add_argument("--w_mrae", type=float, default=0.2)
-    parser.add_argument("--w_sam", type=float, default=0.05)
-    parser.add_argument("--w_spectral_grad", type=float, default=0.05)
-    parser.add_argument("--w_rgb", type=float, default=0.0)
-    parser.add_argument("--response_matrix", type=str, default=None)
+    device = torch.device(DEVICE)
+    response_matrix = load_response_matrix(device)
+    train_loader, val_loader = make_dataloaders(device)
 
-    # Training
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--amp", action="store_true", help="Use mixed precision on CUDA")
-    parser.add_argument("--seed", type=int, default=1234)
+    if train_loader is None:
+        raise RuntimeError("MODE='train' but train_loader is None.")
 
-    # Validation / logging
-    parser.add_argument("--val_every", type=int, default=1)
-    parser.add_argument("--save_every", type=int, default=10)
-    parser.add_argument("--log_every", type=int, default=20)
-    parser.add_argument("--val_mode", type=str, default="denoise", choices=["denoise", "sample"])
-    parser.add_argument("--clip_val_pred", action="store_true", default=True)
-    parser.add_argument("--no_clip_val_pred", action="store_false", dest="clip_val_pred")
-    parser.add_argument("--metric_data_range", type=float, default=1.0)
+    model = build_model(device)
 
-    # I/O
-    parser.add_argument("--out_dir", type=str, default="exp_rgb2hsi")
-    parser.add_argument("--resume", type=str, default=None)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+        betas=(0.9, 0.99),
+    )
 
-    return parser
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=LR_FACTOR,
+        patience=LR_PATIENCE,
+        min_lr=MIN_LR,
+    )
+
+    amp_enabled = USE_AMP and device.type == "cuda"
+    scaler = make_grad_scaler(amp_enabled)
+
+    start_epoch = 1
+    best_val_mrae = math.inf
+    best_val_loss = math.inf
+    epochs_without_improvement = 0
+
+    if RESUME_CHECKPOINT is not None:
+        checkpoint = load_checkpoint(RESUME_CHECKPOINT, device)
+        saved_config = checkpoint.get("model_config", None)
+        if saved_config is not None and saved_config != model_config_dict():
+            raise ValueError(
+                "Resume checkpoint architecture differs from current CONFIG. "
+                "Either update CONFIG or set RESUME_CHECKPOINT=None."
+            )
+        model.load_state_dict(checkpoint["model"], strict=True)
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_val_mrae = float(checkpoint.get("best_val_mrae", math.inf))
+        best_val_loss = float(checkpoint.get("best_val_loss", math.inf))
+        epochs_without_improvement = int(checkpoint.get("epochs_without_improvement", 0))
+        print(f"Resumed from epoch {start_epoch}: {RESUME_CHECKPOINT}")
+
+    print(f"Device: {device}")
+    print(f"Training samples: {len(train_loader.dataset)}")
+    print(f"Validation samples: {len(val_loader.dataset)}")
+    print(f"Model config: {model_config_dict()}")
+    print(f"Loss weights: {LOSS_WEIGHTS}")
+
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
+        model.train()
+
+        running = {
+            "loss": 0.0,
+            "diffusion": 0.0,
+            "coarse_l1": 0.0,
+            "recon_l1": 0.0,
+            "mrae": 0.0,
+            "sam": 0.0,
+            "spectral_grad": 0.0,
+        }
+        count = 0
+
+        for batch in train_loader:
+            rgb, hsi = unpack_batch(batch)
+            rgb = rgb.to(device, non_blocking=(device.type == "cuda"))
+            hsi = hsi.to(device, non_blocking=(device.type == "cuda"))
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with autocast_context(amp_enabled):
+                out = model(
+                    rgb=rgb,
+                    hsi_gt=hsi,
+                    return_loss=True,
+                    response_matrix=response_matrix,
+                    loss_weights=LOSS_WEIGHTS,
+                )
+                loss = out["loss"]
+
+            scaler.scale(loss).backward()
+
+            if GRAD_CLIP_NORM > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            batch_size = rgb.shape[0]
+            running["loss"] += float(out["loss"].item()) * batch_size
+            running["diffusion"] += float(out["loss_diffusion"].item()) * batch_size
+            running["coarse_l1"] += float(out["loss_coarse_l1"].item()) * batch_size
+            running["recon_l1"] += float(out["loss_recon_l1"].item()) * batch_size
+            running["mrae"] += float(out["loss_mrae"].item()) * batch_size
+            running["sam"] += float(out["loss_sam"].item()) * batch_size
+            running["spectral_grad"] += float(out["loss_spectral_grad"].item()) * batch_size
+            count += batch_size
+
+        train_loss = running["loss"] / max(count, 1)
+        train_diffusion = running["diffusion"] / max(count, 1)
+        train_mrae = running["mrae"] / max(count, 1)
+        train_sam = running["sam"] / max(count, 1)
+
+        val_results = validate(model, val_loader, device, response_matrix)
+        scheduler.step(val_results["mrae"])
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        print(
+            f"Epoch {epoch}/{NUM_EPOCHS} "
+            f"| Train Loss {train_loss:.6f} "
+            f"| Train Diff {train_diffusion:.6f} "
+            f"| Train MRAE {train_mrae:.6f} "
+            f"| Train SAM {train_sam:.4f} "
+            f"| Val Loss {val_results['loss']:.6f} "
+            f"| Val MRAE {val_results['mrae']:.6f} "
+            f"| Val RMSE {val_results['rmse']:.6f} "
+            f"| Val SAM {val_results['sam']:.4f} "
+            f"| Val PSNR {val_results['psnr']:.4f} "
+            f"| LR {current_lr:.2e}"
+        )
+
+        if val_results["loss"] < best_val_loss:
+            best_val_loss = val_results["loss"]
+            save_checkpoint(
+                BEST_LOSS_PATH,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_mrae=best_val_mrae,
+                best_val_loss=best_val_loss,
+                epochs_without_improvement=epochs_without_improvement,
+            )
+
+        if val_results["mrae"] < best_val_mrae:
+            best_val_mrae = val_results["mrae"]
+            epochs_without_improvement = 0
+            save_checkpoint(
+                BEST_PATH,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_mrae=best_val_mrae,
+                best_val_loss=best_val_loss,
+                epochs_without_improvement=epochs_without_improvement,
+            )
+            print(f"Saved best model with Val MRAE {best_val_mrae:.6f}")
+        else:
+            epochs_without_improvement += 1
+            print(
+                f"No Val MRAE improvement for "
+                f"{epochs_without_improvement}/{EARLY_STOPPING_PATIENCE} epochs"
+            )
+
+        save_checkpoint(
+            LATEST_PATH,
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            best_val_mrae=best_val_mrae,
+            best_val_loss=best_val_loss,
+            epochs_without_improvement=epochs_without_improvement,
+        )
+
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(f"Early stopping. Best Val MRAE: {best_val_mrae:.6f}")
+            break
+
+
+# ==================================================
+# EVALUATION
+# ==================================================
+
+
+def evaluate() -> None:
+    set_seed(SEED)
+
+    device = torch.device(DEVICE)
+    response_matrix = load_response_matrix(device)
+    _, val_loader = make_dataloaders(device)
+
+    checkpoint_path = Path(EVAL_CHECKPOINT) if EVAL_CHECKPOINT is not None else BEST_PATH
+    checkpoint = load_checkpoint(checkpoint_path, device)
+
+    saved_config = checkpoint.get("model_config", None)
+    if saved_config is not None and saved_config != model_config_dict():
+        raise ValueError(
+            "Evaluation checkpoint architecture differs from current CONFIG. "
+            "Set CONFIG to match the checkpoint or use the correct checkpoint."
+        )
+
+    model = build_model(device)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    model.eval()
+
+    val_results = validate(model, val_loader, device, response_matrix)
+
+    print(f"Evaluated checkpoint: {checkpoint_path}")
+    print(
+        f"MRAE {val_results['mrae']:.6f} "
+        f"| RMSE {val_results['rmse']:.6f} "
+        f"| SAM {val_results['sam']:.4f} "
+        f"| PSNR {val_results['psnr']:.4f}"
+    )
+
+
+# ==================================================
+# MAIN
+# ==================================================
 
 
 def main() -> None:
-    parser = build_argparser()
-    args = parser.parse_args()
-
-    # --no_download has priority over --download.
-    download = bool(args.download and not args.no_download)
-
-    set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "args.json", "w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2)
-
-    train_set = ARADDataset(
-        root_dir=args.root_dir,
-        train=True,
-        train_images=args.train_images,
-        total_images=args.total_images,
-        cube_key=args.cube_key,
-        download=download,
-        image_size=args.image_size,
-        bands=args.bands,
-        hsi_norm=args.hsi_norm,
-        hsi_scale=args.hsi_scale,
-    )
-    val_set = ARADDataset(
-        root_dir=args.root_dir,
-        train=False,
-        train_images=args.train_images,
-        total_images=args.total_images,
-        cube_key=args.cube_key,
-        download=False,
-        image_size=args.image_size,
-        bands=args.bands,
-        hsi_norm=args.hsi_norm,
-        hsi_scale=args.hsi_scale,
-    )
-
-    train_loader = make_loader(train_set, args.batch_size, shuffle=True, num_workers=args.num_workers, seed=args.seed)
-    val_loader = make_loader(val_set, args.batch_size, shuffle=False, num_workers=args.num_workers, seed=args.seed)
-
-    model = RGB2HSI_DifIISR(
-        bands=args.bands,
-        base_channels=args.base_channels,
-        steps=args.steps,
-        kappa=args.kappa,
-        min_noise_level=args.min_noise_level,
-        etas_end=args.etas_end,
-        schedule_power=args.schedule_power,
-        predict_type=args.predict_type,
-        condition_rgb=args.condition_rgb,
-        num_heads=args.num_heads,
-        window_size=args.window_size,
-        dropout=args.dropout,
-    ).to(device)
-
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {num_params / 1e6:.2f} M")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = GradScaler(enabled=args.amp and device.type == "cuda")
-    response_matrix = load_response_matrix(args.response_matrix, bands=args.bands, device=device)
-
-    start_epoch = 1
-    best_mrae = math.inf
-    if args.resume:
-        start_epoch, best_mrae = load_checkpoint(args.resume, model, optimizer, scaler, device)
-        print(f"Resumed from {args.resume}: start_epoch={start_epoch}, best_mrae={best_mrae:.6f}")
-
-    for epoch in range(start_epoch, args.epochs + 1):
-        epoch_start = time.time()
-        train_stats = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-            args=args,
-            response_matrix=response_matrix,
-            epoch=epoch,
-        )
-
-        print(
-            f"Epoch {epoch:03d}/{args.epochs:03d} | "
-            f"Train Loss {train_stats['loss']:.6f} | "
-            f"Diff {train_stats['loss_diffusion']:.6f} | "
-            f"MRAE-loss {train_stats['loss_mrae']:.6f} | "
-            f"SAM-loss {train_stats['loss_sam']:.6f}"
-        )
-
-        did_val = (epoch % args.val_every == 0) or (epoch == args.epochs)
-        if did_val:
-            val_stats = validate(model, val_loader, device, args, response_matrix)
-            print(
-                f"Epoch {epoch:03d}/{args.epochs:03d} | "
-                f"Val Loss {val_stats['val_loss']:.6f} | "
-                f"Val MRAE {val_stats['val_mrae']:.6f} | "
-                f"Val RMSE {val_stats['val_rmse']:.6f} | "
-                f"Val SAM {val_stats['val_sam']:.6f} | "
-                f"Val PSNR {val_stats['val_psnr']:.3f}"
-            )
-
-            if val_stats["val_mrae"] < best_mrae:
-                best_mrae = val_stats["val_mrae"]
-                save_checkpoint(out_dir / "best.pth", model, optimizer, scaler, epoch, best_mrae, args)
-                print(f"Saved best checkpoint: {out_dir / 'best.pth'}")
-
-        save_checkpoint(out_dir / "latest.pth", model, optimizer, scaler, epoch, best_mrae, args)
-        if epoch % args.save_every == 0:
-            save_checkpoint(out_dir / f"epoch_{epoch:03d}.pth", model, optimizer, scaler, epoch, best_mrae, args)
-
-        print(f"Epoch time: {time.time() - epoch_start:.1f}s | Best Val MRAE: {best_mrae:.6f}")
+    if MODE == "train":
+        train()
+    elif MODE == "eval":
+        evaluate()
+    else:
+        raise ValueError("MODE must be 'train' or 'eval'.")
 
 
 if __name__ == "__main__":
