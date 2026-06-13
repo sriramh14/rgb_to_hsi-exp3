@@ -1,3 +1,4 @@
+import torch
 def sam_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Spectral Angle Mapper loss in radians. pred/target: [B,C,H,W]."""
     p = pred.permute(0, 2, 3, 1)
