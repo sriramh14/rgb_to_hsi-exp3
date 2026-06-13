@@ -67,7 +67,7 @@ class RGB2HSI_DifIISR(nn.Module):
         coarse_hsi: torch.Tensor,
         t: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample x_t from q(x_t | hsi_gt, coarse_hsi)."""
         if noise is None:
             noise = torch.randn_like(hsi_gt)
