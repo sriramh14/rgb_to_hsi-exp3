@@ -1,4 +1,5 @@
 import torch
+from models.project_hsi_to_rgb import project_hsi_to_rgb
 def rgb_consistency_loss(
     pred_hsi: torch.Tensor,
     rgb: torch.Tensor,
