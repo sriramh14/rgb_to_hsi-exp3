@@ -1,4 +1,5 @@
-
+import torch
+import torch.nn as nn
 class GroupNorm32(nn.GroupNorm):
     """GroupNorm that chooses a valid number of groups."""
     def __init__(self, channels: int):
