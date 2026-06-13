@@ -3,6 +3,8 @@ import torch.nn as nn
 from .CoarseHSINet import CoarseHSINet
 from .HSIResidualDiffusionUNet import HSIResidualDiffusionUNet
 from typing import Optional
+from .Diffusion_scheduler import extract_to_shape, make_eta_schedule
+
 class RGB2HSI_DifIISR(nn.Module):
     """
     RGB-to-HSI model adapted from DifIISR's residual-shift diffusion idea.
