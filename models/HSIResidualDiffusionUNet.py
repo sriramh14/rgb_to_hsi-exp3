@@ -3,6 +3,7 @@ import torch.nn as nn
 from .ResBlock import ResBlock
 from .WindowAttentionBlock import WindowAttentionBlock
 from .timestep_embedding import timestep_embedding
+from typing import Optional
 class HSIResidualDiffusionUNet(nn.Module):
     """
     U-Net denoiser/refiner.
