@@ -108,8 +108,8 @@ class RGB2HSI_DifIISR(nn.Module):
         noise: Optional[torch.Tensor] = None,
         return_loss: bool = False,
         response_matrix: Optional[torch.Tensor] = None,
-        loss_weights: Optional[Dict[str, float]] = None,
-    ) -> Dict[str, torch.Tensor]:
+        loss_weights: Optional[dict[str, float]] = None,
+    ) -> dict[str, torch.Tensor]:
         coarse_hsi = self.coarse_net(rgb)
         if hsi_gt is None:
             return {"coarse_hsi": coarse_hsi}
@@ -140,8 +140,8 @@ class RGB2HSI_DifIISR(nn.Module):
         model_output: torch.Tensor,
         noise: torch.Tensor,
         response_matrix: Optional[torch.Tensor] = None,
-        loss_weights: Optional[Dict[str, float]] = None,
-    ) -> Dict[str, torch.Tensor]:
+        loss_weights: Optional[dict[str, float]] = None,
+    ) -> dict[str, torch.Tensor]:
         weights = {
             "diffusion": 1.0,
             "coarse_l1": 0.2,
@@ -191,7 +191,7 @@ class RGB2HSI_DifIISR(nn.Module):
         coarse_hsi: torch.Tensor,
         rgb: torch.Tensor,
         clip_denoised: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """One reverse diffusion step."""
         model_output = self.denoiser(x_t=x_t, t=t, coarse_hsi=coarse_hsi, rgb=rgb)
         pred_x0 = self.predict_xstart_from_output(model_output, x_t, coarse_hsi, t)
@@ -214,7 +214,7 @@ class RGB2HSI_DifIISR(nn.Module):
         noise: Optional[torch.Tensor] = None,
         clip_denoised: bool = True,
         return_all: bool = False,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """Full reverse sampling."""
         coarse_hsi = self.coarse_net(rgb)
         if noise is None:
