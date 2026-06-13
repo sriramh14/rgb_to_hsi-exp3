@@ -1,3 +1,19 @@
+class ConvBlock(nn.Module):
+    """Simple conv block for the coarse RGB-to-HSI branch."""
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            GroupNorm32(out_ch),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            GroupNorm32(out_ch),
+            nn.SiLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
 class CoarseHSINet(nn.Module):
     """
     Deterministic RGB-to-HSI coarse reconstructor.
