@@ -1,3 +1,8 @@
+import torch
+import torch.nn as nn
+from .CoarseHSINET import CoarseHSINET
+from .HSIResidualDiffusionUNet import HSIResidualDiffusionUNet
+
 class RGB2HSI_DifIISR(nn.Module):
     """
     RGB-to-HSI model adapted from DifIISR's residual-shift diffusion idea.
