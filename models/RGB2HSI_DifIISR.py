@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .CoarseHSINET import CoarseHSINET
+from .CoarseHSINet import CoarseHSINet
 from .HSIResidualDiffusionUNet import HSIResidualDiffusionUNet
 
 class RGB2HSI_DifIISR(nn.Module):
